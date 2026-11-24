@@ -20,13 +20,14 @@
 // not sold, and the curve already holds real SOL. One fixed-size buy per coin.
 //
 // A round trip costs about 2.7% (1.25% curve fees per side plus two transaction
-// fees on a 0.12 SOL stake), so a flat take-profit would cap every win at a few
-// percent while losers bleed the same — a losing shape. Instead each position is
-// split: half is sold at +25% to bank the pop, and the rest rides with a trailing
-// stop (40% under its best value, armed at the take-profit) so the rare coin that
-// keeps running pays for the many that do not. The rest is cut at -12% under cost,
-// on a creator sell, or on a time limit. A curve that completes is closed by the
-// harness itself; the replay flattens whatever is left when the data ends.
+// fees on a 0.12 SOL stake), so a win must clear that bar before it counts. The
+// exits are therefore fast and whole-position: bank the full win at +15%,
+// cut the whole loss at -10%, never hold past 15 slots, and leave at once when
+// the creator sells. Coins that pop and keep running are the exception, not the
+// rule — on the dev window, holding half back for a runner gave the gains back
+// more often than it caught one, so this version banks everything at the first
+// take-profit instead. A curve that completes is closed by the harness itself;
+// the replay flattens whatever is left when the data ends.
 //
 // Everything is deterministic: no clock, no environment, no randomness, and every
 // iteration runs over insertion-ordered maps fed by the batch stream, so the two
@@ -45,14 +46,10 @@ const MAX_DEV_BUY_LAMPORTS = 1_500_000_000n; // creator's own buy in the create 
 const MAX_BUYERS = 4; // distinct non-creator buyers before entry, at most
 const MAX_RUNUP_BPS = 5000; // price now over the create price, at most (+50%)
 const BUY_SLIPPAGE_BPS = 10_000; // buys go out wide open (latency moves the price)
-const TP1_BPS = 2500; // first take-profit: sell half once up this much (+25%)
-const TP1_PART_BPS = 5000; // share of the position the first take-profit sells (half)
-const SL_BPS = 1200; // exit whole when down this much under cost (-12%)
-const SL_AFTER_TP1_BPS = 1200; // same stop for the runner half, under its cost
-const TRAIL_BPS = 4000; // runner exits on a fall of this much from its best value (-40%)
-const MAX_HOLD_SLOTS = 300; // time limit while the position never took profit
-const MAX_HOLD_AFTER_TP1_SLOTS = 600; // time limit for the runner half
-const HOLD_IF_UP_BPS = 1000; // the gain that waives the plain time limit (+10%)
+const TP_BPS = 1500; // exit the whole position once up this much (+15%)
+const SL_BPS = 1000; // exit whole when down this much under cost (-10%)
+const MAX_HOLD_SLOTS = 15; // time limit while the position is still open
+const HOLD_IF_UP_BPS = 1000; // the gain that waives the time limit (+10%)
 const BPS = 10_000n;
 const FEE_BPS = 125n; // ~95 bps protocol + 30 bps creator, per side
 
@@ -78,9 +75,6 @@ interface Held {
   openedSlot: number;
   /** Transaction fees paid on this position's fills so far. */
   txPaid: bigint;
-  /** Best sell value seen since the take-profit (0n until armed). */
-  best: bigint;
-  tookTp1: boolean;
 }
 
 const coins = new Map<Pubkey, Coin>();
@@ -166,7 +160,7 @@ await runBot({
       const h = held.get(f.mint);
       if (f.status !== 'rejected' && h !== undefined) h.txPaid += BigInt(f.tx_fee_lamports);
       if (f.side === 'buy' && f.status === 'filled' && h === undefined) {
-        held.set(f.mint, { openedSlot: f.slot, txPaid: BigInt(f.tx_fee_lamports), best: 0n, tookTp1: false });
+        held.set(f.mint, { openedSlot: f.slot, txPaid: BigInt(f.tx_fee_lamports) });
       }
     }
     for (const mint of [...selling]) if (!hasPendingSell(state, mint)) selling.delete(mint);
@@ -181,7 +175,7 @@ await runBot({
       const c = coins.get(mint);
       let h = held.get(mint);
       if (h === undefined) {
-        h = { openedSlot: now, txPaid: tx, best: 0n, tookTp1: false };
+        h = { openedSlot: now, txPaid: tx };
         held.set(mint, h);
       }
       let mk = marks.get(mint);
@@ -192,27 +186,14 @@ await runBot({
       }
       const value = sellValue(pos.token_amount, mk.vq, mk.vt) - tx;
       const basis = BigInt(pos.cost_lamports) + h.txPaid;
-      if (value > h.best) h.best = value;
-      // First take-profit: bank half at +25%, the rest becomes a runner.
-      if (!h.tookTp1 && basis > 0n && value * BPS >= basis * (BPS + BigInt(TP1_BPS))) {
-        const part = (pos.token_amount * BigInt(TP1_PART_BPS)) / BPS;
-        if (part > 0n && part < pos.token_amount) {
-          orders.push({ side: 'sell', mint, token_amount: part, max_slippage_bps: 10_000 });
-          selling.add(mint);
-          h.tookTp1 = true;
-          h.best = 0n;
-          if (c !== undefined) c.done = true;
-          continue;
-        }
-      }
       let exit = false;
       if (basis > 0n) {
-        const sl = h.tookTp1 ? BigInt(SL_AFTER_TP1_BPS) : BigInt(SL_BPS);
-        if (value * BPS <= basis * (BPS - sl)) exit = true;
-        if (h.tookTp1 && h.best > 0n && value * BPS <= h.best * (BPS - BigInt(TRAIL_BPS))) exit = true;
+        // Whole-position take-profit: bank the full win as soon as it is there.
+        if (value * BPS >= basis * (BPS + BigInt(TP_BPS))) exit = true;
+        if (value * BPS <= basis * (BPS - BigInt(SL_BPS))) exit = true;
       }
-      if (now - h.openedSlot >= (h.tookTp1 ? MAX_HOLD_AFTER_TP1_SLOTS : MAX_HOLD_SLOTS)) {
-        if (!h.tookTp1 && basis > 0n && value * BPS >= basis * (BPS + BigInt(HOLD_IF_UP_BPS))) {
+      if (now - h.openedSlot >= MAX_HOLD_SLOTS) {
+        if (basis > 0n && value * BPS >= basis * (BPS + BigInt(HOLD_IF_UP_BPS))) {
           // Up enough that the time limit is waived: let it run.
         } else {
           exit = true;

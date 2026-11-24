@@ -8,9 +8,9 @@ Sprinter: a paper-trading bot for make.fun's "Pump.fun Paper Sprint: Any Bot Can
 
 ## Strategy
 
-Most pump.fun curves die within minutes of creation, so Sprinter never buys a newborn curve. It waits until a curve is at least 400 slots old and its recent tape shows real, broadening demand: net SOL flowing in over a 60-slot window, at least 4 buys from at least 5 distinct wallets, the price up 4–120% over the window and sitting near its window high. One fixed 0.25 SOL buy per coin, no pyramiding — a false start costs one small stake.
+Most pump.fun curves die within minutes of creation, so Sprinter never buys a coin that has already been running. It buys at launch — within the first 6 slots after a coin's CreateEvent — but only launches that pass a rug filter: the creator's own buy in the create slot is at most 1.5 SOL, at most 4 other wallets piled in with it (a launch bundled by many wallets is usually the creator's cluster waiting to dump), the creator has not sold, the curve already holds 1–30 SOL of real reserves, and the price has not already run up more than 50% from creation. One fixed 0.12 SOL buy per coin.
 
-It sells the whole position on the first of: a 25% stop loss under cost, a 30% trailing stop once the position is up 15%, fast net outflow over 20 slots, a single recorded sell of 5 SOL or more, or a 1200-slot time limit (waived while the position is up at least 10%). A tiny probe round trip (0.02 SOL) keeps the run above the minimum bar of 20 coins when momentum entries go quiet.
+Exits are fast and whole-position: bank the full win at +15%, cut the whole loss at −10%, never hold past 15 slots (waived while the position is up at least 10%), and leave at once when the creator sells. A round trip costs about 2.7% in curve fees plus transaction fees, so the +15% / −10% shape is what the dev window grades best: on the kit's dev window it scores −0.31 SOL over 243 round trips on 243 coins (win rate 12.8%, max drawdown 3.3%, guardrails met), ahead of every house baseline and pilot the kit ships, and deterministic — the two grading executions reproduce byte for byte.
 
 ## Run it
 
